@@ -427,6 +427,9 @@ async def channel_allowed(ctx: commands.Context) -> bool:
         return True
     if ctx.command and ctx.command.name in EXEMPT_COMMANDS:
         return True
+    # The owner and whitelisted users can use commands anywhere they want.
+    if ctx.author.id == OWNER_ID or ctx.author.id in data["wl"]:
+        return True
     allowed = data.get("allowed_channels", [])
     if not allowed:  # nothing configured yet -> no restriction
         return True
@@ -496,7 +499,7 @@ async def set_lang(ctx: commands.Context):
 
 
 # ─── Command: translate ───────────────────────────────────────
-@bot.command(name="translate", aliases=["tr"])
+@bot.command(name="translate", aliases=["tr", "t"])
 async def translate(ctx: commands.Context, *, content: str = None):
     """Translate text into the language YOU set with *set.
 

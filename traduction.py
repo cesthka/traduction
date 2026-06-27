@@ -66,7 +66,9 @@ auto_channels: set[int] = set()
 
 # ─── Leash (dog) system ───────────────────────────────────────
 DOG_EMOJI = "🐕"
-DATA_FILE = "leash_data.json"  # local fallback when no database is configured
+# Where the JSON file lives. Set DATA_FILE to a path inside a Railway volume
+# (e.g. /data/leash_data.json) so it survives redeploys without a database.
+DATA_FILE = os.environ.get("DATA_FILE", "leash_data.json")
 
 # ─── Persistent storage ───────────────────────────────────────
 # On Railway the filesystem is wiped on every redeploy, so we store everything
@@ -157,6 +159,10 @@ def save_data() -> None:
         except Exception as e:
             print(f"⚠️ Database save failed: {e}")
     else:
+        # Make sure the folder exists (e.g. a volume mount path).
+        folder = os.path.dirname(DATA_FILE)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 

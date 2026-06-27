@@ -1,27 +1,37 @@
 """
-Bot Discord — Traduction Turc → Français
------------------------------------------
-Préfixe des commandes : *
+Discord Translation Bot
+------------------------
+Command prefix: *
 
-Commandes :
-  *traduire <texte>   (alias *tr)  → traduit un texte turc en français
-  *auto                            → active/désactive l'auto-traduction dans le salon
-  *aide                (alias *help)→ affiche l'aide
+Commands:
+  *translate <text>        (alias *tr)   -> auto-detects the language, translates to English
+  *translate <code> <text>               -> translate to a given language (e.g. fr, es, tr)
+  *languages               (alias *langs)-> list available language codes
+  *auto                                  -> toggle auto-translation in the current channel
+  *help                                  -> show help
 
-Bonus :
-  Réagis avec 🇹🇷 sur un message    → le bot le traduit en français
+  🐕 Leash system (owner / whitelist only):
+  *leash <@member|id>      (alias *dog)  -> leash a member (or unleash if already leashed)
+  *dogs                                  -> show your leashed members
+  *wl add|remove|list [@member]          -> manage the whitelist (owner only)
+
+Bonus:
+  React with a country flag on a message -> translates it into that language.
+
+The Turkish input is cleaned up before translation (slang, missing accents,
+repeated letters, upper/lowercase) for much better quality.
 """
 
 import os
 import json
 import re
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from deep_translator import GoogleTranslator
 from langdetect import detect, LangDetectException
 
-# Charge le fichier .env s'il existe (pratique en local).
-# Sans python-dotenv installé, on ignore simplement cette étape.
+# Load a .env file if present (handy locally).
+# If python-dotenv isn't installed, just skip this step.
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -34,155 +44,179 @@ except ImportError:
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 PREFIX = "*"
-TRIGGER_EMOJI = "🇹🇷"
 
-# ID du propriétaire du bot (en dur) : seul cet utilisateur peut utiliser
-# les commandes réservées à l'owner.
+# Per-user translation: everyone picks their own language with *set.
+# Default target only used as a fallback in the engine; *translate uses each
+# user's chosen language instead.
+DEFAULT_TARGET = "en"
+
+# Auto-translation always targets French (kept on purpose).
+AUTO_TARGET = "fr"
+
+# How often the reminder message is posted in auto channels.
+REMINDER_MINUTES = 15
+
+# Hardcoded bot owner ID: only this user can run owner-only commands.
 OWNER_ID = 142365250803466240
 
-# Salons où l'auto-traduction est active (géré via la commande *auto)
+# Channels where auto-translation is active (managed via the owner-only *auto).
+# Loaded from the data file at startup so it survives restarts.
 auto_channels: set[int] = set()
 
-# ─── Système de laisse (dog) ──────────────────────────────────
-EMOJI_CHIEN = "🐕"
-DATA_FILE = "laisse_data.json"  # créé automatiquement à côté de bot.py
+# ─── Leash (dog) system ───────────────────────────────────────
+DOG_EMOJI = "🐕"
+DATA_FILE = "leash_data.json"  # created automatically next to bot.py
 
 
-def charger_donnees() -> dict:
-    """Charge les laisses et la whitelist depuis le fichier JSON."""
+def load_data() -> dict:
+    """Load leashes, whitelist, per-user languages and auto channels."""
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         d = {}
-    d.setdefault("laisses", {})  # { "guild_id:user_id": {...} }
-    d.setdefault("wl", [])       # [user_id, ...]
+    d.setdefault("leashes", {})        # { "guild_id:user_id": {...} }
+    d.setdefault("wl", [])             # [user_id, ...]
+    d.setdefault("user_lang", {})      # { "user_id": "lang_code" }
+    d.setdefault("auto_channels", [])  # [channel_id, ...]
     return d
 
 
-def sauver_donnees() -> None:
+def save_data() -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-data = charger_donnees()
+data = load_data()
+auto_channels = set(data["auto_channels"])  # in-memory mirror, kept in sync
 
 
-def cle_laisse(guild_id: int, user_id: int) -> str:
+def get_user_lang(user_id: int) -> str | None:
+    """Return the language a user has set, or None if they haven't set one."""
+    return data["user_lang"].get(str(user_id))
+
+
+def set_user_lang(user_id: int, code: str) -> None:
+    data["user_lang"][str(user_id)] = code
+    save_data()
+
+
+def leash_key(guild_id: int, user_id: int) -> str:
     return f"{guild_id}:{user_id}"
 
 
-def formater_pseudo(base_name: str, maitre_name: str) -> str:
-    """Construit '<pseudo> (🐕 de <maître>)' en respectant la limite Discord (32)."""
-    suffixe = f" ({EMOJI_CHIEN} de {maitre_name})"
-    place_dispo = 32 - len(suffixe)
-    if place_dispo < 1:
-        # Le nom du maître est trop long : on garde juste le suffixe tronqué
-        return suffixe.strip()[:32]
-    return base_name[:place_dispo] + suffixe
+def format_nick(base_name: str, master_name: str) -> str:
+    """Build '<name> (🐕 of <master>)' within Discord's 32-char limit."""
+    suffix = f" ({DOG_EMOJI} of {master_name})"
+    room = 32 - len(suffix)
+    if room < 1:
+        # Master name too long: keep just the truncated suffix
+        return suffix.strip()[:32]
+    return base_name[:room] + suffix
+
 
 # ──────────────────────────────────────────────────────────────
-#  TRADUCTION
+#  TRANSLATION ENGINE
 # ──────────────────────────────────────────────────────────────
 
-# Moteur DeepL optionnel : si la variable d'environnement DEEPL_API_KEY est
-# définie, on l'utilise en priorité (meilleure qualité), avec repli sur Google.
+# Optional DeepL engine: if the DEEPL_API_KEY env var is set, it is used first
+# (better quality), with an automatic fallback to Google.
 DEEPL_KEY = os.environ.get("DEEPL_API_KEY")
 
-# Langues connues : code -> (nom français, drapeau)
-LANGUES = {
-    "fr": ("Français", "🇫🇷"),
-    "tr": ("Turc", "🇹🇷"),
-    "en": ("Anglais", "🇬🇧"),
-    "es": ("Espagnol", "🇪🇸"),
-    "de": ("Allemand", "🇩🇪"),
-    "it": ("Italien", "🇮🇹"),
-    "pt": ("Portugais", "🇵🇹"),
-    "nl": ("Néerlandais", "🇳🇱"),
-    "ru": ("Russe", "🇷🇺"),
-    "ar": ("Arabe", "🇸🇦"),
-    "ja": ("Japonais", "🇯🇵"),
-    "ko": ("Coréen", "🇰🇷"),
-    "zh-CN": ("Chinois", "🇨🇳"),
-    "pl": ("Polonais", "🇵🇱"),
-    "ro": ("Roumain", "🇷🇴"),
-    "uk": ("Ukrainien", "🇺🇦"),
-    "el": ("Grec", "🇬🇷"),
-    "sv": ("Suédois", "🇸🇪"),
+# Known languages: code -> (English name, flag)
+LANGUAGES = {
+    "en": ("English", "🇬🇧"),
+    "fr": ("French", "🇫🇷"),
+    "tr": ("Turkish", "🇹🇷"),
+    "es": ("Spanish", "🇪🇸"),
+    "de": ("German", "🇩🇪"),
+    "it": ("Italian", "🇮🇹"),
+    "pt": ("Portuguese", "🇵🇹"),
+    "nl": ("Dutch", "🇳🇱"),
+    "ru": ("Russian", "🇷🇺"),
+    "ar": ("Arabic", "🇸🇦"),
+    "ja": ("Japanese", "🇯🇵"),
+    "ko": ("Korean", "🇰🇷"),
+    "zh-CN": ("Chinese", "🇨🇳"),
+    "pl": ("Polish", "🇵🇱"),
+    "ro": ("Romanian", "🇷🇴"),
+    "uk": ("Ukrainian", "🇺🇦"),
+    "el": ("Greek", "🇬🇷"),
+    "sv": ("Swedish", "🇸🇪"),
     "hi": ("Hindi", "🇮🇳"),
 }
 
-# Réagir avec l'un de ces drapeaux traduit le message dans la langue associée.
-DRAPEAU_VERS_LANGUE = {
-    "🇫🇷": "fr", "🇹🇷": "tr", "🇬🇧": "en", "🇺🇸": "en", "🇪🇸": "es",
+# Reacting with one of these flags translates the message into that language.
+FLAG_TO_LANG = {
+    "🇬🇧": "en", "🇺🇸": "en", "🇫🇷": "fr", "🇹🇷": "tr", "🇪🇸": "es",
     "🇩🇪": "de", "🇮🇹": "it", "🇵🇹": "pt", "🇧🇷": "pt", "🇳🇱": "nl",
     "🇷🇺": "ru", "🇸🇦": "ar", "🇯🇵": "ja", "🇰🇷": "ko", "🇨🇳": "zh-CN",
     "🇵🇱": "pl", "🇷🇴": "ro", "🇺🇦": "uk", "🇬🇷": "el", "🇸🇪": "sv", "🇮🇳": "hi",
 }
 
-LIMITE_CARACTERES = 4500  # marge sous la limite des moteurs (~5000)
+CHAR_LIMIT = 4500  # stays under the engines' ~5000-char cap
 
 
-def info_langue(code: str | None) -> tuple[str, str]:
-    """Renvoie (nom, drapeau) pour un code de langue, normalisé."""
+def language_info(code: str | None) -> tuple[str, str]:
+    """Return (name, flag) for a language code, normalized."""
     if not code:
-        return ("Inconnue", "🌐")
+        return ("Unknown", "🌐")
     code = code.lower()
     if code in ("zh", "zh-cn"):
         code = "zh-CN"
-    for k, v in LANGUES.items():
+    for k, v in LANGUAGES.items():
         if k.lower() == code.lower():
             return v
     return (code, "🌐")
 
 
-def detecter_langue(texte: str) -> str | None:
+def detect_language(text: str) -> str | None:
     try:
-        return detect(texte)
+        return detect(text)
     except LangDetectException:
         return None
 
 
-def _decouper(texte: str, taille: int = LIMITE_CARACTERES) -> list[str]:
-    """Découpe un long texte en morceaux sous la limite, sans couper les mots."""
-    if len(texte) <= taille:
-        return [texte]
-    morceaux, courant = [], ""
-    for mot in texte.split(" "):
-        if len(courant) + len(mot) + 1 > taille:
-            if courant:
-                morceaux.append(courant)
-            courant = mot
+def _chunk(text: str, size: int = CHAR_LIMIT) -> list[str]:
+    """Split long text into chunks under the limit, without cutting words."""
+    if len(text) <= size:
+        return [text]
+    chunks, current = [], ""
+    for word in text.split(" "):
+        if len(current) + len(word) + 1 > size:
+            if current:
+                chunks.append(current)
+            current = word
         else:
-            courant = f"{courant} {mot}".strip()
-    if courant:
-        morceaux.append(courant)
-    return morceaux
+            current = f"{current} {word}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-def _moteur(texte: str, cible: str, source: str = "auto") -> str:
-    """Traduit un morceau : DeepL si dispo (repli Google en cas d'échec)."""
+def _engine(text: str, target: str, source: str = "auto") -> str:
+    """Translate one chunk: DeepL if available (Google fallback on failure)."""
     if DEEPL_KEY:
         try:
             from deep_translator import DeeplTranslator
             return DeeplTranslator(
-                api_key=DEEPL_KEY, source=source, target=cible, use_free_api=True
-            ).translate(texte)
+                api_key=DEEPL_KEY, source=source, target=target, use_free_api=True
+            ).translate(text)
         except Exception:
-            pass  # repli silencieux sur Google
-    return GoogleTranslator(source=source, target=cible).translate(texte)
+            pass  # silent fallback to Google
+    return GoogleTranslator(source=source, target=target).translate(text)
 
 
 # ══════════════════════════════════════════════════════════════
-#  PRÉ-TRAITEMENT DU TURC  (pour une traduction TR→XX bien meilleure)
+#  TURKISH PRE-PROCESSING  (for much better TR -> XX translation)
 # ══════════════════════════════════════════════════════════════
-# Le turc de chat est souvent : abrégé (slm, nbr, tmm), sans accents
-# (cok au lieu de çok), avec des lettres répétées (çoook). Les moteurs de
-# traduction s'en sortent mal. On "réécrit" donc le texte en turc correct
-# AVANT de le traduire, ce qui améliore énormément la compréhension.
+# Chat Turkish is often abbreviated (slm, nbr, tmm), written without accents
+# (cok instead of çok), or with repeated letters (çoook). Translation engines
+# handle this poorly, so we rewrite the text into proper Turkish BEFORE
+# translating, which greatly improves comprehension.
 
-# 1) Argot / abréviations -> turc correct
-ARGOT_TR = {
+# 1) Slang / abbreviations -> proper Turkish
+SLANG_TR = {
     "slm": "selam", "mrb": "merhaba", "mrhb": "merhaba",
     "nbr": "ne haber", "naber": "ne haber", "nrb": "ne haber", "napıyon": "ne yapıyorsun",
     "napıyosun": "ne yapıyorsun", "napıyorsun": "ne yapıyorsun", "naptın": "ne yaptın",
@@ -197,11 +231,11 @@ ARGOT_TR = {
     "ewt": "evet", "evt": "evet", "hyr": "hayır", "yh": "ya", "yha": "ya",
     "bi": "bir", "bişi": "bir şey", "bişey": "bir şey", "bişeyler": "bir şeyler",
     "valla": "vallahi", "vallaha": "vallahi", "vallahi": "vallahi",
-    "niye": "neden", "naptın": "ne yaptın", "knkam": "kankam",
-    " msj": "mesaj", "msj": "mesaj", "selamun": "selamün",
+    "niye": "neden", "knkam": "kankam",
+    "msj": "mesaj", "selamun": "selamün",
 }
 
-# 2) Turc sans accents -> turc accentué (formes non ambiguës uniquement)
+# 2) Accent-less Turkish -> accented Turkish (unambiguous forms only)
 ACCENTS_TR = {
     "nasilsin": "nasılsın", "nasilsiniz": "nasılsınız", "nasil": "nasıl",
     "gunaydin": "günaydın", "iyiyim": "iyiyim", "tesekkur": "teşekkür",
@@ -223,8 +257,8 @@ ACCENTS_TR = {
     "biliyom": "biliyorum", "gidiyom": "gidiyorum", "geliyom": "geliyorum",
 }
 
-# Mots distinctement turcs : leur présence indique du turc (même sans accents)
-INDICES_TURC = {
+# Distinctly Turkish words: their presence signals Turkish (even without accents)
+TURKISH_HINTS = {
     "bir", "bu", "ben", "sen", "biz", "için", "icin", "çok", "cok", "değil", "degil",
     "var", "yok", "evet", "hayır", "hayir", "nasıl", "nasil", "nasılsın", "nasilsin",
     "selam", "merhaba", "teşekkürler", "tesekkurler", "kanka", "abi", "tamam",
@@ -232,77 +266,77 @@ INDICES_TURC = {
     "ve", "ama", "şey", "sey", "çünkü", "cunku", "şimdi", "simdi", "kardeş", "kardes",
 }
 
-# Caractères propres au turc, minuscules ET majuscules. On exclut volontairement
-# i / I (ambigus) et ç/ö/ü (présents en français).
-_CHARS_TURCS = set("ışğİŞĞ")
+# Turkish-distinct characters, lower AND upper case. We deliberately exclude
+# i / I (ambiguous) and ç/ö/ü (also used in French).
+TURKISH_CHARS = set("ışğİŞĞ")
 
 
-def _reduire_repetitions(mot: str) -> str:
-    """çoook -> çok, yaaa -> ya (réduit 3+ lettres identiques à 1)."""
-    return re.sub(r"(.)\1{2,}", r"\1", mot)
+def _collapse_repeats(word: str) -> str:
+    """çoook -> çok, yaaa -> ya (collapse 3+ identical letters to 1)."""
+    return re.sub(r"(.)\1{2,}", r"\1", word)
 
 
-def _formes_min(mot: str) -> tuple[str, ...]:
-    """Renvoie les formes minuscules possibles d'un mot.
+def _lower_forms(word: str) -> tuple[str, ...]:
+    """Return the possible lowercase forms of a word.
 
-    En turc, 'I' majuscule devient 'ı' (sans point), alors qu'ailleurs c'est 'i'.
-    On teste donc les DEUX versions pour que la détection marche en MAJUSCULES.
-    Ex : 'NASILSIN' -> ('nasilsin', 'nasılsın')
+    In Turkish, uppercase 'I' becomes 'ı' (dotless), whereas elsewhere it is 'i'.
+    We test BOTH versions so detection works in UPPERCASE.
+    e.g. 'NASILSIN' -> ('nasilsin', 'nasılsın')
     """
-    standard = mot.lower()                                   # I -> i
-    turc = mot.replace("İ", "i").replace("I", "ı").lower()   # I -> ı
-    return (standard,) if standard == turc else (standard, turc)
+    standard = word.lower()                                  # I -> i
+    turkish = word.replace("İ", "i").replace("I", "ı").lower()  # I -> ı
+    return (standard,) if standard == turkish else (standard, turkish)
 
 
-def ressemble_turc(texte: str) -> bool:
-    """Vrai si le texte est probablement du turc (même en majuscules / sans accents)."""
-    if any(c in _CHARS_TURCS for c in texte):
+def looks_turkish(text: str) -> bool:
+    """True if the text is likely Turkish (even in uppercase / without accents)."""
+    if any(c in TURKISH_CHARS for c in text):
         return True
-    if detecter_langue(texte) == "tr":
+    if detect_language(text) == "tr":
         return True
-    mots = re.findall(r"\w+", texte, re.UNICODE)
+    words = re.findall(r"\w+", text, re.UNICODE)
     hits = 0
-    for m in mots:
+    for w in words:
         if any(
-            f in INDICES_TURC or f in ARGOT_TR or f in ACCENTS_TR
-            for f in _formes_min(m)
+            f in TURKISH_HINTS or f in SLANG_TR or f in ACCENTS_TR
+            for f in _lower_forms(w)
         ):
             hits += 1
-    # 1 indice suffit pour un message court, 2 pour un message plus long
-    return hits >= (1 if len(mots) <= 3 else 2)
+    # 1 hint is enough for a short message, 2 for a longer one
+    return hits >= (1 if len(words) <= 3 else 2)
 
 
-def pretraiter_turc(texte: str) -> str:
-    """Réécrit le turc de chat en turc correct avant traduction (majuscules incluses)."""
-    morceaux = re.findall(r"\w+|[^\w\s]+|\s+", texte, re.UNICODE)
-    sortie = []
-    for tok in morceaux:
+def preprocess_turkish(text: str) -> str:
+    """Rewrite chat Turkish into proper Turkish before translation (uppercase included)."""
+    tokens = re.findall(r"\w+|[^\w\s]+|\s+", text, re.UNICODE)
+    out = []
+    for tok in tokens:
         if tok.isspace() or not re.match(r"\w", tok, re.UNICODE):
-            sortie.append(tok)
+            out.append(tok)
             continue
-        base = _reduire_repetitions(tok)
-        remplacement = None
-        for forme in _formes_min(base):
-            if forme in ARGOT_TR:
-                remplacement = ARGOT_TR[forme]
+        base = _collapse_repeats(tok)
+        replacement = None
+        for form in _lower_forms(base):
+            if form in SLANG_TR:
+                replacement = SLANG_TR[form]
                 break
-            if forme in ACCENTS_TR:
-                remplacement = ACCENTS_TR[forme]
+            if form in ACCENTS_TR:
+                replacement = ACCENTS_TR[form]
                 break
-        sortie.append(remplacement if remplacement is not None else base)
-    return "".join(sortie)
+        out.append(replacement if replacement is not None else base)
+    return "".join(out)
 
 
-def traduire_texte(texte: str, cible: str = "fr") -> str:
-    """Traduit un texte vers `cible`. Le turc bénéficie d'un pré-traitement
-    dédié + d'un forçage de la langue source pour une qualité bien supérieure."""
+def translate_text(text: str, target: str = DEFAULT_TARGET) -> str:
+    """Translate text to `target`. Turkish gets dedicated pre-processing plus a
+    forced source language for much higher quality."""
     source = "auto"
-    a_traduire = texte
-    if cible != "tr" and ressemble_turc(texte):
-        a_traduire = pretraiter_turc(texte)
+    to_translate = text
+    if target != "tr" and looks_turkish(text):
+        to_translate = preprocess_turkish(text)
         source = "tr"
-    parties = [_moteur(m, cible, source) for m in _decouper(a_traduire)]
-    return " ".join(p for p in parties if p)
+    parts = [_engine(c, target, source) for c in _chunk(to_translate)]
+    return " ".join(p for p in parts if p)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -311,262 +345,346 @@ def traduire_texte(texte: str, cible: str = "fr") -> str:
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # nécessaire pour le système de laisse (pseudos, arrivées)
+intents.members = True  # required for the leash system (nicknames, joins)
 
-# On retire la commande d'aide par défaut pour utiliser la nôtre
+# Remove the default help command so we can use our own.
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 
 @bot.event
 async def on_ready():
-    print(f"✅ Connecté en tant que {bot.user} (id: {bot.user.id})")
-    print(f"   Préfixe : {PREFIX}")
+    print(f"✅ Logged in as {bot.user} (id: {bot.user.id})")
+    print(f"   Prefix: {PREFIX}")
+    if not reminder_loop.is_running():
+        reminder_loop.start()
 
 
-# ─── Check : réservé à l'owner ─────────────────────────────────
-def est_owner():
-    """Décorateur : ajoute @est_owner() au-dessus d'une commande
-    pour la réserver à l'owner (OWNER_ID)."""
+# ─── Periodic reminder (rotating messages, every REMINDER_MINUTES) ─────
+REMINDER_MESSAGES = [
+    f"🌐 **Don't forget to set your language!** Run `{PREFIX}set` to pick it, then "
+    f"use `{PREFIX}translate <text>` to translate anything into your own language.",
+
+    f"🌐 **Can't understand a message?** React to it with your country's flag, or use "
+    f"`{PREFIX}translate <text>`. First time? Set your language with `{PREFIX}set`.",
+
+    f"🌐 **Tip:** with `{PREFIX}set` you choose your language once, and every "
+    f"`{PREFIX}translate` after that comes back in that language. Give it a try!",
+]
+_reminder_index = 0
+
+
+@tasks.loop(minutes=REMINDER_MINUTES)
+async def reminder_loop():
+    global _reminder_index
+    if not auto_channels:
+        return
+    message = REMINDER_MESSAGES[_reminder_index % len(REMINDER_MESSAGES)]
+    _reminder_index += 1
+    for channel_id in list(auto_channels):
+        channel = bot.get_channel(channel_id)
+        if channel is not None:
+            try:
+                await channel.send(message)
+            except Exception as e:
+                print(f"Reminder error: {e}")
+
+
+@reminder_loop.before_loop
+async def _before_reminder():
+    await bot.wait_until_ready()
+
+
+# ─── Check: owner-only ─────────────────────────────────────────
+def is_owner():
+    """Decorator: add @is_owner() above a command to restrict it to the owner."""
     async def predicate(ctx: commands.Context) -> bool:
         return ctx.author.id == OWNER_ID
     return commands.check(predicate)
 
 
-# ─── Commande : traduire ──────────────────────────────────────
-@bot.command(name="traduire", aliases=["tr"])
-async def traduire(ctx: commands.Context, *, contenu: str = None):
-    """Traduit un texte vers le français (ou une autre langue).
+# ─── UI: language picker for *set ─────────────────────────────
+class LanguageSelect(discord.ui.Select):
+    def __init__(self, author_id: int):
+        self.author_id = author_id
+        options = [
+            discord.SelectOption(label=name, value=code, emoji=flag)
+            for code, (name, flag) in LANGUAGES.items()
+        ]
+        super().__init__(
+            placeholder="Choose your language…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
 
-    Usages :
-      • *traduire <texte>            → traduit vers le français
-      • *traduire <code> <texte>     → traduit vers la langue <code> (ex : en, es, tr)
-      • (en réponse à un message) *traduire [code]  → traduit le message visé
+    async def callback(self, interaction: discord.Interaction):
+        # Only the person who ran *set may use their own menu.
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "⛔ This menu isn't for you. Run `*set` to choose your own language.",
+                ephemeral=True,
+            )
+            return
+        code = self.values[0]
+        set_user_lang(self.author_id, code)
+        name, flag = language_info(code)
+        embed = discord.Embed(
+            title="✅ Language set",
+            description=(
+                f"Your language is now {flag} **{name}**.\n"
+                f"Use `{PREFIX}translate <text>` and translations will come to you "
+                f"in {name}."
+            ),
+            color=0x3BA55D,
+        )
+        # Disable the menu after a choice is made.
+        self.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class SetLanguageView(discord.ui.View):
+    def __init__(self, author_id: int):
+        super().__init__(timeout=120)
+        self.add_item(LanguageSelect(author_id))
+
+
+# ─── Command: set (choose your language) ──────────────────────
+@bot.command(name="set")
+async def set_lang(ctx: commands.Context):
+    """Open a menu to pick your personal translation language."""
+    current = get_user_lang(ctx.author.id)
+    if current:
+        name, flag = language_info(current)
+        desc = f"Your current language is {flag} **{name}**.\nPick a new one below:"
+    else:
+        desc = "Pick the language you want your translations in:"
+    embed = discord.Embed(title="🌐 Set your language", description=desc, color=0x3B88C3)
+    await ctx.reply(embed=embed, view=SetLanguageView(ctx.author.id), mention_author=False)
+
+
+# ─── Command: translate ───────────────────────────────────────
+@bot.command(name="translate", aliases=["tr"])
+async def translate(ctx: commands.Context, *, content: str = None):
+    """Translate text into the language YOU set with *set.
+
+    Usage:
+      • *translate <text>                  -> translate into your language
+      • (replying to a message) *translate -> translate that message into your language
     """
-    # Récupère le texte depuis le message auquel on répond, si besoin.
-    texte = contenu
-    cible = "fr"
-
-    # Si le premier mot est un code de langue connu, c'est la cible.
-    if contenu:
-        premier, _, reste = contenu.partition(" ")
-        codes_acceptes = {k.lower() for k in LANGUES} | {"zh"}
-        if premier.lower() in codes_acceptes:
-            cible = "zh-CN" if premier.lower() in ("zh", "zh-cn") else premier.lower()
-            texte = reste.strip() or None
-
-    # Cas réponse à un message : on traduit le message visé.
-    if not texte and ctx.message.reference is not None:
-        ref = ctx.message.reference
-        message_cible = ref.resolved
-        if message_cible is None or isinstance(
-            message_cible, discord.DeletedReferencedMessage
-        ):
-            try:
-                message_cible = await ctx.channel.fetch_message(ref.message_id)
-            except Exception:
-                message_cible = None
-        if message_cible and message_cible.content:
-            texte = message_cible.content
-
-    if not texte:
+    # Everyone can use this, but they must have set a language first.
+    target = get_user_lang(ctx.author.id)
+    if not target:
         await ctx.reply(
-            f"Utilisation : `{PREFIX}traduire <texte>` "
-            f"ou `{PREFIX}traduire <code> <texte>` (ex : `en`, `es`, `tr`).\n"
-            f"Tu peux aussi répondre à un message avec `{PREFIX}traduire`. "
-            f"Liste des langues : `{PREFIX}langues`."
+            f"🌐 You need to set your language first. Run `{PREFIX}set` and pick "
+            "your language, then you can translate anything."
+        )
+        return
+
+    text = content
+
+    # Reply case: translate the referenced message.
+    if not text and ctx.message.reference is not None:
+        ref = ctx.message.reference
+        target_msg = ref.resolved
+        if target_msg is None or isinstance(target_msg, discord.DeletedReferencedMessage):
+            try:
+                target_msg = await ctx.channel.fetch_message(ref.message_id)
+            except Exception:
+                target_msg = None
+        if target_msg and target_msg.content:
+            text = target_msg.content
+
+    if not text:
+        await ctx.reply(
+            f"Usage: `{PREFIX}translate <text>`, or reply to a message with "
+            f"`{PREFIX}translate`."
         )
         return
 
     try:
         async with ctx.typing():
-            traduction = traduire_texte(texte, cible)
-        code_source = detecter_langue(texte)
-        nom_src, drap_src = info_langue(code_source)
-        nom_dst, drap_dst = info_langue(cible)
+            translation = translate_text(text, target)
+        src_code = detect_language(text)
+        src_name, src_flag = language_info(src_code)
+        dst_name, dst_flag = language_info(target)
 
         embed = discord.Embed(color=0x3B88C3)
-        embed.add_field(name=f"{drap_src} {nom_src}", value=texte[:1024], inline=False)
-        embed.add_field(
-            name=f"{drap_dst} {nom_dst}", value=traduction[:1024], inline=False
-        )
+        embed.add_field(name=f"{src_flag} {src_name}", value=text[:1024], inline=False)
+        embed.add_field(name=f"{dst_flag} {dst_name}", value=translation[:1024], inline=False)
         await ctx.reply(embed=embed, mention_author=False)
     except Exception as e:
-        await ctx.reply(f"❌ Erreur lors de la traduction : {e}")
+        await ctx.reply(f"❌ Translation error: {e}")
 
 
-# ─── Commande : langues ───────────────────────────────────────
-@bot.command(name="langues", aliases=["langs"])
-async def langues(ctx: commands.Context):
-    """Affiche les codes de langue disponibles."""
-    lignes = [f"{drap} `{code}` — {nom}" for code, (nom, drap) in LANGUES.items()]
+# ─── Command: languages ───────────────────────────────────────
+@bot.command(name="languages", aliases=["langs"])
+async def languages(ctx: commands.Context):
+    """Show the available languages (the same list as in *set)."""
+    lines = [f"{flag} `{code}` — {name}" for code, (name, flag) in LANGUAGES.items()]
     embed = discord.Embed(
-        title="🌐 Langues disponibles",
-        description="\n".join(lignes),
+        title="🌐 Available languages",
+        description="\n".join(lines),
         color=0x3B88C3,
     )
-    embed.set_footer(
-        text="Exemple : *traduire en bonjour  •  ou réagis avec un drapeau sur un message"
-    )
+    embed.set_footer(text="Set yours with *set  •  or react with a flag on a message")
     await ctx.reply(embed=embed, mention_author=False)
 
 
-# ─── Commande : auto (réservée à l'owner) ─────────────────────
+# ─── Command: auto (owner only, always French) ────────────────
 @bot.command(name="auto")
-@est_owner()
+@is_owner()
 async def auto(ctx: commands.Context):
-    """Active ou désactive l'auto-traduction dans ce salon."""
+    """Toggle auto-translation (to French) in this channel."""
     cid = ctx.channel.id
     if cid in auto_channels:
         auto_channels.discard(cid)
-        await ctx.reply("🔴 Auto-traduction **désactivée** dans ce salon.")
+        data["auto_channels"] = list(auto_channels)
+        save_data()
+        await ctx.reply("🔴 Auto-translation **disabled** in this channel.")
     else:
         auto_channels.add(cid)
+        data["auto_channels"] = list(auto_channels)
+        save_data()
         await ctx.reply(
-            "🟢 Auto-traduction **activée** dans ce salon.\n"
-            "Les messages détectés comme turcs seront traduits automatiquement."
+            "🟢 Auto-translation **enabled** in this channel.\n"
+            "Messages not in French will be translated to French automatically."
         )
 
 
 # ──────────────────────────────────────────────────────────────
-#  SYSTÈME DE LAISSE (DOG)
+#  LEASH (DOG) SYSTEM
 # ──────────────────────────────────────────────────────────────
 
-def peut_laisser(user_id: int) -> bool:
-    """L'owner et les whitelistés peuvent utiliser la laisse."""
+def can_leash(user_id: int) -> bool:
+    """The owner and whitelisted users can use the leash."""
     return user_id == OWNER_ID or user_id in data["wl"]
 
 
-def nb_chiens(maitre_id: int) -> int:
-    return sum(1 for v in data["laisses"].values() if v["master_id"] == maitre_id)
+def dog_count(master_id: int) -> int:
+    return sum(1 for v in data["leashes"].values() if v["master_id"] == master_id)
 
 
-# ─── Commande : laisse / dog ──────────────────────────────────
-@bot.command(name="laisse", aliases=["dog"])
-async def laisse(ctx: commands.Context, membre: discord.Member = None):
-    """Met une personne en laisse (ou la détache si elle l'est déjà)."""
-    auteur = ctx.author.id
+# ─── Command: leash / dog ─────────────────────────────────────
+@bot.command(name="leash", aliases=["dog"])
+async def leash(ctx: commands.Context, member: discord.Member = None):
+    """Leash a member (or unleash them if already leashed)."""
+    author = ctx.author.id
 
-    if not peut_laisser(auteur):
-        await ctx.reply("⛔ Tu n'as pas la permission d'utiliser cette commande.")
+    if not can_leash(author):
+        await ctx.reply("⛔ You don't have permission to use this command.")
         return
-    if membre is None:
-        await ctx.reply(f"Utilisation : `{PREFIX}laisse <@membre ou id>`")
+    if member is None:
+        await ctx.reply(f"Usage: `{PREFIX}leash <@member or id>`")
         return
 
-    cle = cle_laisse(ctx.guild.id, membre.id)
+    key = leash_key(ctx.guild.id, member.id)
 
-    # ── Si déjà en laisse → on détache (toggle) ──
-    if cle in data["laisses"]:
-        info = data["laisses"][cle]
-        if auteur != OWNER_ID and info["master_id"] != auteur:
-            await ctx.reply("⛔ Ce chien appartient à quelqu'un d'autre.")
+    # ── Already leashed -> unleash (toggle) ──
+    if key in data["leashes"]:
+        info = data["leashes"][key]
+        if author != OWNER_ID and info["master_id"] != author:
+            await ctx.reply("⛔ This dog belongs to someone else.")
             return
-        del data["laisses"][cle]
-        sauver_donnees()
+        del data["leashes"][key]
+        save_data()
         try:
-            await membre.edit(nick=info.get("base_name"))
+            await member.edit(nick=info.get("base_name"))
         except discord.Forbidden:
             pass
-        await ctx.reply(f"🦴 {membre.mention} n'est plus en laisse.")
+        await ctx.reply(f"🦴 {member.mention} is no longer leashed.")
         return
 
-    # ── Sinon on attache ──
-    # Limite : un WL ne peut avoir qu'un seul chien à la fois (l'owner = illimité)
-    if auteur != OWNER_ID and nb_chiens(auteur) >= 1:
+    # ── Otherwise leash them ──
+    # Limit: a whitelisted user may only have one dog at a time (owner = unlimited)
+    if author != OWNER_ID and dog_count(author) >= 1:
         await ctx.reply(
-            "⛔ En tant que whitelisté, tu ne peux avoir qu'**un seul** chien à la fois."
+            "⛔ As a whitelisted user, you can only have **one** dog at a time."
         )
         return
 
-    base_name = membre.display_name
-    nouveau_nick = formater_pseudo(base_name, ctx.author.display_name)
+    base_name = member.display_name
+    new_nick = format_nick(base_name, ctx.author.display_name)
     try:
-        await membre.edit(nick=nouveau_nick)
+        await member.edit(nick=new_nick)
     except discord.Forbidden:
         await ctx.reply(
-            "❌ Impossible de renommer cette personne "
-            "(son rôle est au-dessus du mien, ou c'est le propriétaire du serveur)."
+            "❌ I can't rename this person "
+            "(their role is above mine, or they are the server owner)."
         )
         return
 
-    data["laisses"][cle] = {
-        "master_id": auteur,
+    data["leashes"][key] = {
+        "master_id": author,
         "master_name": ctx.author.display_name,
         "base_name": base_name,
-        "nick": nouveau_nick,
+        "nick": new_nick,
     }
-    sauver_donnees()
-    await ctx.reply(f"{EMOJI_CHIEN} {membre.mention} est maintenant en laisse.")
+    save_data()
+    await ctx.reply(f"{DOG_EMOJI} {member.mention} is now leashed.")
 
 
-# ─── Commande : dogs (voir ses chiens) ────────────────────────
-@bot.command(name="dogs", aliases=["chiens", "listdog"])
+# ─── Command: dogs (list your dogs) ───────────────────────────
+@bot.command(name="dogs", aliases=["doglist"])
 async def dogs(ctx: commands.Context):
-    """Affiche la liste de tes chiens (toutes les laisses si tu es l'owner)."""
-    auteur = ctx.author.id
-    if not peut_laisser(auteur):
-        await ctx.reply("⛔ Tu n'as pas la permission d'utiliser cette commande.")
+    """Show your dogs (all leashes if you are the owner)."""
+    author = ctx.author.id
+    if not can_leash(author):
+        await ctx.reply("⛔ You don't have permission to use this command.")
         return
 
-    if auteur == OWNER_ID:
-        entrees = list(data["laisses"].items())
-        titre = "🐕 Tous les chiens"
+    if author == OWNER_ID:
+        entries = list(data["leashes"].items())
+        title = "🐕 All dogs"
     else:
-        entrees = [
-            (k, v) for k, v in data["laisses"].items() if v["master_id"] == auteur
-        ]
-        titre = "🐕 Tes chiens"
+        entries = [(k, v) for k, v in data["leashes"].items() if v["master_id"] == author]
+        title = "🐕 Your dogs"
 
-    if not entrees:
-        await ctx.reply("Aucun chien en laisse pour le moment.")
+    if not entries:
+        await ctx.reply("No leashed members right now.")
         return
 
-    lignes = []
-    for cle, info in entrees:
-        _, user_id = cle.split(":")
-        if auteur == OWNER_ID:
-            lignes.append(f"• <@{user_id}> — maître : <@{info['master_id']}>")
+    lines = []
+    for key, info in entries:
+        _, user_id = key.split(":")
+        if author == OWNER_ID:
+            lines.append(f"• <@{user_id}> — master: <@{info['master_id']}>")
         else:
-            lignes.append(f"• <@{user_id}>")
+            lines.append(f"• <@{user_id}>")
 
-    embed = discord.Embed(
-        title=titre,
-        description="\n".join(lignes),
-        color=0x8B5A2B,
-    )
+    embed = discord.Embed(title=title, description="\n".join(lines), color=0x8B5A2B)
     await ctx.reply(embed=embed, mention_author=False)
 
 
-# ─── Commande : wl (gestion whitelist, owner only) ────────────
+# ─── Command: wl (whitelist management, owner only) ───────────
 @bot.command(name="wl")
-@est_owner()
-async def wl(ctx: commands.Context, action: str = None, membre: discord.Member = None):
-    """Gère la whitelist : *wl add|remove|list [@membre]"""
-    if action == "add" and membre:
-        if membre.id not in data["wl"]:
-            data["wl"].append(membre.id)
-            sauver_donnees()
-        await ctx.reply(f"✅ {membre.mention} ajouté à la whitelist.")
-    elif action in ("remove", "del", "retirer") and membre:
-        if membre.id in data["wl"]:
-            data["wl"].remove(membre.id)
-            sauver_donnees()
-        await ctx.reply(f"✅ {membre.mention} retiré de la whitelist.")
+@is_owner()
+async def wl(ctx: commands.Context, action: str = None, member: discord.Member = None):
+    """Manage the whitelist: *wl add|remove|list [@member]"""
+    if action == "add" and member:
+        if member.id not in data["wl"]:
+            data["wl"].append(member.id)
+            save_data()
+        await ctx.reply(f"✅ {member.mention} added to the whitelist.")
+    elif action in ("remove", "del") and member:
+        if member.id in data["wl"]:
+            data["wl"].remove(member.id)
+            save_data()
+        await ctx.reply(f"✅ {member.mention} removed from the whitelist.")
     elif action == "list":
         if not data["wl"]:
-            await ctx.reply("La whitelist est vide.")
+            await ctx.reply("The whitelist is empty.")
         else:
-            lignes = "\n".join(f"• <@{uid}>" for uid in data["wl"])
-            await ctx.reply(f"**Whitelist :**\n{lignes}")
+            lines = "\n".join(f"• <@{uid}>" for uid in data["wl"])
+            await ctx.reply(f"**Whitelist:**\n{lines}")
     else:
-        await ctx.reply(f"Utilisation : `{PREFIX}wl add|remove|list [@membre]`")
+        await ctx.reply(f"Usage: `{PREFIX}wl add|remove|list [@member]`")
 
 
-# ─── Événement : forcer le pseudo (anti-changement) ───────────
+# ─── Event: enforce nickname (anti-change) ────────────────────
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    cle = cle_laisse(after.guild.id, after.id)
-    info = data["laisses"].get(cle)
+    key = leash_key(after.guild.id, after.id)
+    info = data["leashes"].get(key)
     if not info:
         return
     if after.nick != info["nick"]:
@@ -576,140 +694,145 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             pass
 
 
-# ─── Événement : ré-appliquer la laisse au retour sur le serveur ─
+# ─── Event: re-apply leash when the member rejoins ────────────
 @bot.event
-async def on_member_join(membre: discord.Member):
-    cle = cle_laisse(membre.guild.id, membre.id)
-    info = data["laisses"].get(cle)
+async def on_member_join(member: discord.Member):
+    key = leash_key(member.guild.id, member.id)
+    info = data["leashes"].get(key)
     if not info:
         return
     try:
-        await membre.edit(nick=info["nick"])
+        await member.edit(nick=info["nick"])
     except discord.Forbidden:
         pass
 
 
-# ─── Commande : aide ──────────────────────────────────────────
-@bot.command(name="aide", aliases=["help"])
-async def aide(ctx: commands.Context):
-    """Affiche la liste des commandes."""
+# ─── Command: help ────────────────────────────────────────────
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    """Show the list of commands."""
     embed = discord.Embed(
-        title="🤖 Bot de traduction",
-        description=f"Préfixe : `{PREFIX}`",
+        title="🤖 Translation bot",
+        description=f"Prefix: `{PREFIX}`",
         color=0x3B88C3,
     )
     embed.add_field(
-        name=f"{PREFIX}traduire <texte>  (ou {PREFIX}tr)",
+        name=f"{PREFIX}set",
         value=(
-            "Détecte la langue et traduit vers le **français**.\n"
-            f"• `{PREFIX}traduire <code> <texte>` → traduit vers une autre langue "
-            "(ex : `en`, `es`, `tr`).\n"
-            f"• Réponds à un message avec `{PREFIX}traduire [code]` pour le traduire."
+            "**Start here.** Opens a menu to choose your language. "
+            "You must set it before translating."
         ),
         inline=False,
     )
     embed.add_field(
-        name="Réactions drapeaux 🇬🇧 🇹🇷 🇪🇸 …",
-        value="Réagis sur un message avec un drapeau pour le traduire dans cette langue.",
+        name=f"{PREFIX}translate <text>  (or {PREFIX}tr)",
+        value=(
+            "Translates text into **your** language (the one you set).\n"
+            f"• Reply to a message with `{PREFIX}translate` to translate that message."
+        ),
         inline=False,
     )
     embed.add_field(
-        name=f"{PREFIX}langues",
-        value="Affiche tous les codes de langue disponibles.",
+        name="Flag reactions 🇫🇷 🇹🇷 🇪🇸 …",
+        value="React on a message with a flag to translate it into that language.",
         inline=False,
     )
     embed.add_field(
-        name=f"{PREFIX}auto",
-        value="Active/désactive l'auto-traduction du salon (toute langue → français).",
+        name=f"{PREFIX}languages",
+        value="Show all available languages.",
         inline=False,
     )
     embed.add_field(
-        name=f"{PREFIX}aide",
-        value="Affiche ce message d'aide.",
+        name=f"{PREFIX}help",
+        value="Show this help message.",
         inline=False,
     )
 
-    # Commandes de laisse : visibles seulement par l'owner et les WL
-    if peut_laisser(ctx.author.id):
+    # Owner-only command shown only to the owner.
+    if ctx.author.id == OWNER_ID:
         embed.add_field(
-            name="\u200b",
-            value="**🐕 Système de laisse**",
+            name=f"{PREFIX}auto  *(owner)*",
+            value="Toggle auto-translation to French in the channel.",
             inline=False,
         )
+
+    # Leash commands: visible only to the owner and whitelisted users.
+    if can_leash(ctx.author.id):
+        embed.add_field(name="\u200b", value="**🐕 Leash system**", inline=False)
         embed.add_field(
-            name=f"{PREFIX}laisse <@membre>  (ou {PREFIX}dog)",
-            value="Met la personne en laisse, ou la détache si elle l'est déjà.",
+            name=f"{PREFIX}leash <@member>  (or {PREFIX}dog)",
+            value="Leash the member, or unleash them if already leashed.",
             inline=False,
         )
         embed.add_field(
             name=f"{PREFIX}dogs",
-            value="Affiche la liste de tes chiens.",
+            value="Show your leashed members.",
             inline=False,
         )
         if ctx.author.id == OWNER_ID:
             embed.add_field(
-                name=f"{PREFIX}wl add|remove|list [@membre]",
-                value="Gère la whitelist (owner uniquement).",
+                name=f"{PREFIX}wl add|remove|list [@member]",
+                value="Manage the whitelist (owner only).",
                 inline=False,
             )
 
     await ctx.reply(embed=embed, mention_author=False)
 
 
-# ─── Auto-traduction des messages ─────────────────────────────
+# ─── Auto-translation of messages ─────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Auto-traduction si le salon est activé (et que ce n'est pas une commande)
+    # Auto-translate if the channel is enabled (and it's not a command)
     if (
         message.channel.id in auto_channels
         and message.content
         and not message.content.startswith(PREFIX)
-        and len(message.content) >= 4  # évite les faux positifs sur messages courts
+        and len(message.content) >= 4  # avoid false positives on short messages
     ):
-        langue = detecter_langue(message.content)
-        if langue and langue.lower() != "fr":
+        lang = detect_language(message.content)
+        if (lang and lang.lower() != AUTO_TARGET) or looks_turkish(message.content):
             try:
-                traduction = traduire_texte(message.content, "fr")
-                nom, drapeau = info_langue(langue)
+                translation = translate_text(message.content, AUTO_TARGET)
+                name, flag = language_info(lang)
                 await message.reply(
-                    f"🇫🇷 {traduction}  *( {drapeau} {nom} )*", mention_author=False
+                    f"🇫🇷 {translation}  *( {flag} {name} )*", mention_author=False
                 )
             except Exception as e:
-                print(f"Erreur de traduction : {e}")
+                print(f"Translation error: {e}")
 
-    # Indispensable pour que les commandes continuent de fonctionner
+    # Required so commands keep working
     await bot.process_commands(message)
 
 
-# ─── Traduction par réaction (n'importe quel drapeau) ─────────
+# ─── Translation by reaction (any flag) ───────────────────────
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     if user.bot:
         return
-    cible = DRAPEAU_VERS_LANGUE.get(str(reaction.emoji))
-    if not cible:
+    target = FLAG_TO_LANG.get(str(reaction.emoji))
+    if not target:
         return
     message = reaction.message
     if not message.content:
         return
     try:
-        traduction = traduire_texte(message.content, cible)
-        _, drapeau = info_langue(cible)
-        await message.reply(f"{drapeau} {traduction}", mention_author=False)
+        translation = translate_text(message.content, target)
+        _, flag = language_info(target)
+        await message.reply(f"{flag} {translation}", mention_author=False)
     except Exception as e:
-        print(f"Erreur de traduction : {e}")
+        print(f"Translation error: {e}")
 
 
-# ─── Gestion des erreurs de commande ──────────────────────────
+# ─── Command error handling ───────────────────────────────────
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.CheckFailure):
-        await ctx.reply("⛔ Cette commande est réservée à l'owner du bot.")
+        await ctx.reply("⛔ This command is reserved for the bot owner.")
     elif isinstance(error, commands.CommandNotFound):
-        pass  # on ignore les commandes inconnues
+        pass  # ignore unknown commands
     else:
         raise error
 
@@ -718,7 +841,7 @@ async def on_command_error(ctx: commands.Context, error):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit(
-            "❌ Aucun token trouvé. Définis la variable d'environnement "
-            "DISCORD_TOKEN avant de lancer le bot."
+            "❌ No token found. Set the DISCORD_TOKEN environment variable "
+            "before running the bot."
         )
     bot.run(TOKEN)

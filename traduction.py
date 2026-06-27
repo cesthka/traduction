@@ -25,6 +25,7 @@ repeated letters, upper/lowercase) for much better quality.
 import os
 import json
 import re
+import asyncio
 import discord
 from discord.ext import commands, tasks
 from deep_translator import GoogleTranslator
@@ -81,6 +82,9 @@ def load_data() -> dict:
     d.setdefault("auto_channels", [])  # [channel_id, ...]
     d.setdefault("reminder_channel", None)  # channel_id for reminder messages
     d.setdefault("allowed_channels", [])    # channels where commands are allowed
+    d.setdefault("autorole", None)          # role_id auto-given on join
+    d.setdefault("welcome_channel", None)   # channel_id for welcome messages
+    d.setdefault("welcome_message", None)   # welcome message template
     return d
 
 
@@ -661,6 +665,145 @@ async def allows(ctx: commands.Context):
 
 
 # ──────────────────────────────────────────────────────────────
+#  ROLES & WELCOME  (owner only)
+# ──────────────────────────────────────────────────────────────
+
+def render_welcome(template: str, member: discord.Member) -> str:
+    """Replace {placeholders} in a welcome template with real values."""
+    return (
+        template
+        .replace("{user}", member.mention)
+        .replace("{username}", member.name)
+        .replace("{name}", member.display_name)
+        .replace("{server}", member.guild.name)
+        .replace("{membercount}", str(member.guild.member_count))
+        .replace("{count}", str(member.guild.member_count))
+        .replace("{id}", str(member.id))
+    )
+
+
+# ─── Command: massiverole (give a role to everyone) ───────────
+@bot.command(name="massiverole", aliases=["massrole"])
+@is_owner()
+async def massiverole(ctx: commands.Context, role: discord.Role = None):
+    """Give a role to every (non-bot) member of the server."""
+    if role is None:
+        await ctx.reply(f"Usage: `{PREFIX}massiverole <@role or id>`")
+        return
+
+    status = await ctx.reply(
+        f"⏳ Adding {role.mention} to everyone… this may take a while."
+    )
+    added, skipped, failed = 0, 0, 0
+    for member in ctx.guild.members:
+        if member.bot or role in member.roles:
+            skipped += 1
+            continue
+        try:
+            await member.add_roles(role, reason=f"massiverole by {ctx.author}")
+            added += 1
+        except discord.Forbidden:
+            failed += 1
+        except discord.HTTPException:
+            failed += 1
+
+    note = f" • {failed} failed (role above mine?)" if failed else ""
+    await status.edit(
+        content=f"✅ Done. {role.mention} added to **{added}** members "
+        f"({skipped} already had it{note})."
+    )
+
+
+# ─── Command: autorole (role given automatically on join) ─────
+@bot.command(name="autorole")
+@is_owner()
+async def autorole(ctx: commands.Context, role: discord.Role = None):
+    """Set the role automatically given to new members (or 'off' to disable)."""
+    last_word = ctx.message.content.split()[-1].lower() if ctx.message.content else ""
+    if role is None and last_word in ("off", "none", "disable"):
+        data["autorole"] = None
+        save_data()
+        await ctx.reply("🔴 Auto-role **disabled**.")
+        return
+    if role is None:
+        current = data.get("autorole")
+        if current:
+            await ctx.reply(
+                f"Current auto-role: <@&{current}>.\n"
+                f"Change it with `{PREFIX}autorole <role>`, or disable with "
+                f"`{PREFIX}autorole off`."
+            )
+        else:
+            await ctx.reply(f"Usage: `{PREFIX}autorole <@role or id>` (or `off`).")
+        return
+    data["autorole"] = role.id
+    save_data()
+    await ctx.reply(f"🟢 New members will now automatically receive {role.mention}.")
+
+
+# ─── Command: setjoin (configure the welcome message) ─────────
+@bot.command(name="setjoin")
+@is_owner()
+async def setjoin(ctx: commands.Context):
+    """Configure the welcome message via an in-chat prompt."""
+    current = data.get("welcome_message")
+    embed = discord.Embed(
+        title="📨 Welcome message setup",
+        description="Set the message sent when a new member joins.",
+        color=0x5865F2,
+    )
+    if current:
+        embed.add_field(name="Current message", value=current[:1024], inline=False)
+    embed.add_field(
+        name="Available placeholders",
+        value=(
+            "`{user}` — mention / ping the new member\n"
+            "`{username}` — their username\n"
+            "`{name}` — their display name\n"
+            "`{server}` — the server name\n"
+            "`{membercount}` — number of members\n"
+            "`{id}` — their user ID"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="What to do now",
+        value=(
+            f"**Send your welcome message** in this channel.\n"
+            f"It will be posted in {ctx.channel.mention} on every join.\n\n"
+            f"To **cancel**, type `cancel` or just send nothing (times out in 120s)."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Example:  Welcome {user} to {server}! You're member #{membercount}.")
+    await ctx.reply(embed=embed, mention_author=False)
+
+    def check(m: discord.Message) -> bool:
+        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=120)
+    except asyncio.TimeoutError:
+        await ctx.send("⌛ Timed out — welcome message left unchanged.")
+        return
+
+    if reply.content.strip().lower() == "cancel":
+        await ctx.send("❌ Cancelled — welcome message left unchanged.")
+        return
+
+    data["welcome_message"] = reply.content
+    data["welcome_channel"] = ctx.channel.id
+    save_data()
+
+    preview = render_welcome(reply.content, ctx.author)
+    done = discord.Embed(title="✅ Welcome message saved", color=0x3BA55D)
+    done.add_field(name="Template", value=reply.content[:1024], inline=False)
+    done.add_field(name="Preview", value=preview[:1024], inline=False)
+    done.add_field(name="Posted in", value=ctx.channel.mention, inline=False)
+    await ctx.send(embed=done)
+
+
+# ──────────────────────────────────────────────────────────────
 #  LEASH (DOG) SYSTEM
 # ──────────────────────────────────────────────────────────────
 
@@ -803,17 +946,38 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             pass
 
 
-# ─── Event: re-apply leash when the member rejoins ────────────
+# ─── Event: on member join (leash re-apply + autorole + welcome) ──
 @bot.event
 async def on_member_join(member: discord.Member):
+    # 1) Re-apply leash if the member was leashed before leaving.
     key = leash_key(member.guild.id, member.id)
     info = data["leashes"].get(key)
-    if not info:
-        return
-    try:
-        await member.edit(nick=info["nick"])
-    except discord.Forbidden:
-        pass
+    if info:
+        try:
+            await member.edit(nick=info["nick"])
+        except discord.Forbidden:
+            pass
+
+    # 2) Auto-role.
+    role_id = data.get("autorole")
+    if role_id:
+        role = member.guild.get_role(role_id)
+        if role:
+            try:
+                await member.add_roles(role, reason="autorole")
+            except discord.Forbidden:
+                pass
+
+    # 3) Welcome message.
+    ch_id = data.get("welcome_channel")
+    template = data.get("welcome_message")
+    if ch_id and template:
+        channel = member.guild.get_channel(ch_id)
+        if channel is not None:
+            try:
+                await channel.send(render_welcome(template, member))
+            except Exception as e:
+                print(f"Welcome error: {e}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -945,6 +1109,21 @@ def _embed_config(level: str) -> discord.Embed:
         ),
         inline=False,
     )
+    embed.add_field(
+        name=f"{PREFIX}autorole <role | off>",
+        value="Automatically give a role to every new member.",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{PREFIX}massiverole <role>",
+        value="Give a role to everyone currently on the server.",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{PREFIX}setjoin",
+        value="Set the welcome message (with placeholders like `{user}`, `{membercount}`).",
+        inline=False,
+    )
     return embed
 
 
@@ -1055,6 +1234,11 @@ async def on_command_error(ctx: commands.Context, error):
         )
     elif isinstance(error, commands.CheckFailure):
         await ctx.reply("⛔ This command is reserved for the bot owner.")
+    elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        await ctx.reply(
+            f"⚠️ Couldn't read that — check the command and try again "
+            f"(see `{PREFIX}help`)."
+        )
     elif isinstance(error, commands.CommandNotFound):
         pass  # ignore unknown commands
     else:

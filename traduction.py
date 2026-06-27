@@ -79,6 +79,8 @@ def load_data() -> dict:
     d.setdefault("wl", [])             # [user_id, ...]
     d.setdefault("user_lang", {})      # { "user_id": "lang_code" }
     d.setdefault("auto_channels", [])  # [channel_id, ...]
+    d.setdefault("reminder_channel", None)  # channel_id for reminder messages
+    d.setdefault("allowed_channels", [])    # channels where commands are allowed
     return d
 
 
@@ -376,11 +378,18 @@ _reminder_index = 0
 @tasks.loop(minutes=REMINDER_MINUTES)
 async def reminder_loop():
     global _reminder_index
-    if not auto_channels:
-        return
+    # Prefer the dedicated reminder channel; otherwise fall back to auto channels.
+    reminder_channel = data.get("reminder_channel")
+    if reminder_channel:
+        targets = [reminder_channel]
+    elif auto_channels:
+        targets = list(auto_channels)
+    else:
+        return  # nowhere to post
+
     message = REMINDER_MESSAGES[_reminder_index % len(REMINDER_MESSAGES)]
     _reminder_index += 1
-    for channel_id in list(auto_channels):
+    for channel_id in targets:
         channel = bot.get_channel(channel_id)
         if channel is not None:
             try:
@@ -400,6 +409,30 @@ def is_owner():
     async def predicate(ctx: commands.Context) -> bool:
         return ctx.author.id == OWNER_ID
     return commands.check(predicate)
+
+
+# ─── Global check: command channels ───────────────────────────
+class WrongChannel(commands.CheckFailure):
+    """Raised when a command is used in a non-allowed channel."""
+
+
+# Commands allowed anywhere (translate works everywhere; the allow-management
+# commands must work anywhere so the owner can never get locked out).
+EXEMPT_COMMANDS = {"translate", "allow", "unallow", "allows"}
+
+
+@bot.check
+async def channel_allowed(ctx: commands.Context) -> bool:
+    if ctx.guild is None:  # never restrict DMs
+        return True
+    if ctx.command and ctx.command.name in EXEMPT_COMMANDS:
+        return True
+    allowed = data.get("allowed_channels", [])
+    if not allowed:  # nothing configured yet -> no restriction
+        return True
+    if ctx.channel.id in allowed:
+        return True
+    raise WrongChannel()
 
 
 # ─── UI: language picker for *set ─────────────────────────────
@@ -548,6 +581,79 @@ async def auto(ctx: commands.Context):
         await ctx.reply(
             "🟢 Auto-translation **enabled** in this channel.\n"
             "Messages not in French will be translated to French automatically."
+        )
+
+
+# ─── Command: setreminder (owner only) ────────────────────────
+@bot.command(name="setreminder", aliases=["reminderchannel"])
+@is_owner()
+async def setreminder(ctx: commands.Context, channel: discord.TextChannel = None):
+    """Set the channel where the periodic reminder is posted.
+
+    Usage:
+      • *setreminder            -> use the current channel
+      • *setreminder #channel   -> use a specific channel
+      • *setreminder off        -> disable reminders
+    """
+    # Allow "*setreminder off" to disable.
+    if channel is None and ctx.message.content.split()[-1].lower() in ("off", "stop", "none"):
+        data["reminder_channel"] = None
+        save_data()
+        await ctx.reply("🔕 Reminders are now **disabled**.")
+        return
+
+    target = channel or ctx.channel
+    data["reminder_channel"] = target.id
+    save_data()
+    await ctx.reply(
+        f"🔔 Reminders will now be posted in {target.mention} "
+        f"every {REMINDER_MINUTES} minutes."
+    )
+
+
+# ─── Commands: allow / unallow / allows (owner only) ──────────
+@bot.command(name="allow")
+@is_owner()
+async def allow(ctx: commands.Context, channel: discord.TextChannel = None):
+    """Allow commands to be used in a channel (current one by default)."""
+    target = channel or ctx.channel
+    if target.id not in data["allowed_channels"]:
+        data["allowed_channels"].append(target.id)
+        save_data()
+    await ctx.reply(
+        f"✅ Commands are now allowed in {target.mention}. "
+        f"(`{PREFIX}translate` still works everywhere.)"
+    )
+
+
+@bot.command(name="unallow", aliases=["disallow"])
+@is_owner()
+async def unallow(ctx: commands.Context, channel: discord.TextChannel = None):
+    """Stop allowing commands in a channel (current one by default)."""
+    target = channel or ctx.channel
+    if target.id in data["allowed_channels"]:
+        data["allowed_channels"].remove(target.id)
+        save_data()
+        await ctx.reply(f"✅ Commands are no longer allowed in {target.mention}.")
+    else:
+        await ctx.reply(f"{target.mention} wasn't in the allowed list.")
+
+
+@bot.command(name="allows", aliases=["allowlist"])
+@is_owner()
+async def allows(ctx: commands.Context):
+    """List the channels where commands are allowed."""
+    chans = data["allowed_channels"]
+    if not chans:
+        await ctx.reply(
+            "No command channels set yet — commands work **everywhere**. "
+            f"Use `{PREFIX}allow` to restrict them to specific channels."
+        )
+    else:
+        lines = "\n".join(f"• <#{cid}>" for cid in chans)
+        await ctx.reply(
+            f"**Command channels:**\n{lines}\n\n"
+            f"(`{PREFIX}translate` works in every channel.)"
         )
 
 
@@ -707,76 +813,183 @@ async def on_member_join(member: discord.Member):
         pass
 
 
-# ─── Command: help ────────────────────────────────────────────
-@bot.command(name="help")
-async def help_cmd(ctx: commands.Context):
-    """Show the list of commands."""
+# ──────────────────────────────────────────────────────────────
+#  HELP  (category dropdown, permission-aware)
+# ──────────────────────────────────────────────────────────────
+
+LEVELS = {"member": 0, "wl": 1, "owner": 2}
+
+
+def perm_level(user_id: int) -> str:
+    if user_id == OWNER_ID:
+        return "owner"
+    if user_id in data["wl"]:
+        return "wl"
+    return "member"
+
+
+# Each category declares the minimum level needed to see it.
+CATEGORIES = {
+    "home": {"label": "Home", "emoji": "🏠", "min": "member"},
+    "translate": {"label": "Translate", "emoji": "🌍", "min": "member"},
+    "leash": {"label": "Leash", "emoji": "🐕", "min": "wl"},
+    "config": {"label": "Configuration", "emoji": "⚙️", "min": "owner"},
+}
+
+
+def allowed_categories(level: str) -> list[str]:
+    n = LEVELS[level]
+    return [c for c, meta in CATEGORIES.items() if LEVELS[meta["min"]] <= n]
+
+
+def _embed_home(level: str) -> discord.Embed:
+    if level == "owner":
+        who = "You're an **owner** — you can see every command.\n"
+    elif level == "wl":
+        who = "You're **whitelisted** — extra commands are unlocked.\n"
+    else:
+        who = ""
     embed = discord.Embed(
-        title="🤖 Translation bot",
-        description=f"Prefix: `{PREFIX}`",
+        title="📖 Bot help",
+        description=(
+            "Translate messages into any language.\n" + who + "Pick a category below."
+        ),
+        color=0x3B88C3,
+    )
+    cats = [c for c in allowed_categories(level) if c != "home"]
+    embed.add_field(
+        name="Categories",
+        value="\n".join(f"{CATEGORIES[c]['emoji']} {CATEGORIES[c]['label']}" for c in cats),
+        inline=False,
+    )
+    embed.set_footer(text=f"Prefix: {PREFIX}")
+    return embed
+
+
+def _embed_translate(level: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🌍 Translate",
+        description="Everything you need to understand any message.",
         color=0x3B88C3,
     )
     embed.add_field(
         name=f"{PREFIX}set",
-        value=(
-            "**Start here.** Opens a menu to choose your language. "
-            "You must set it before translating."
-        ),
+        value="**Start here.** Opens a menu to choose your language.",
         inline=False,
     )
     embed.add_field(
         name=f"{PREFIX}translate <text>  (or {PREFIX}tr)",
         value=(
-            "Translates text into **your** language (the one you set).\n"
-            f"• Reply to a message with `{PREFIX}translate` to translate that message."
+            "Translates text into **your** language.\n"
+            f"• Reply to a message with `{PREFIX}translate` to translate it."
         ),
         inline=False,
     )
     embed.add_field(
-        name="Flag reactions 🇫🇷 🇹🇷 🇪🇸 …",
-        value="React on a message with a flag to translate it into that language.",
+        name="Flag reactions 🇬🇧 🇫🇷 🇹🇷 …",
+        value="React with a flag to translate a message into that language.",
+        inline=False,
+    )
+    embed.add_field(name=f"{PREFIX}languages", value="Show all available languages.", inline=False)
+    embed.add_field(name=f"{PREFIX}help", value="Open this help menu.", inline=False)
+    return embed
+
+
+def _embed_leash(level: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🐕 Leash",
+        description="Commands for whitelisted users and the owner.",
+        color=0x8B5A2B,
+    )
+    embed.add_field(
+        name=f"{PREFIX}leash <@member>  (or {PREFIX}dog)",
+        value="Leash a member, or unleash them if already leashed.",
+        inline=False,
+    )
+    embed.add_field(name=f"{PREFIX}dogs", value="Show your leashed members.", inline=False)
+    wl_value = ", ".join(f"<@{uid}>" for uid in data["wl"]) if data["wl"] else "*(empty)*"
+    embed.add_field(name="📋 Whitelist", value=wl_value, inline=False)
+    if level == "owner":
+        embed.add_field(
+            name=f"{PREFIX}wl add|remove|list [@member]",
+            value="Manage the whitelist (owner only).",
+            inline=False,
+        )
+    return embed
+
+
+def _embed_config(level: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="⚙️ Configuration",
+        description="Owner-only setup.",
+        color=0x5865F2,
+    )
+    embed.add_field(
+        name=f"{PREFIX}auto",
+        value="Toggle auto-translation (to French) in a channel.",
         inline=False,
     )
     embed.add_field(
-        name=f"{PREFIX}languages",
-        value="Show all available languages.",
+        name=f"{PREFIX}setreminder [#channel | off]",
+        value="Choose the channel for the periodic reminder (or disable it).",
         inline=False,
     )
     embed.add_field(
-        name=f"{PREFIX}help",
-        value="Show this help message.",
+        name=f"{PREFIX}allow / {PREFIX}unallow / {PREFIX}allows",
+        value=(
+            "Set which channels commands can be used in (keeps the chat clean). "
+            f"`{PREFIX}translate` always works everywhere."
+        ),
         inline=False,
     )
+    return embed
 
-    # Owner-only command shown only to the owner.
-    if ctx.author.id == OWNER_ID:
-        embed.add_field(
-            name=f"{PREFIX}auto  *(owner)*",
-            value="Toggle auto-translation to French in the channel.",
-            inline=False,
-        )
 
-    # Leash commands: visible only to the owner and whitelisted users.
-    if can_leash(ctx.author.id):
-        embed.add_field(name="\u200b", value="**🐕 Leash system**", inline=False)
-        embed.add_field(
-            name=f"{PREFIX}leash <@member>  (or {PREFIX}dog)",
-            value="Leash the member, or unleash them if already leashed.",
-            inline=False,
-        )
-        embed.add_field(
-            name=f"{PREFIX}dogs",
-            value="Show your leashed members.",
-            inline=False,
-        )
-        if ctx.author.id == OWNER_ID:
-            embed.add_field(
-                name=f"{PREFIX}wl add|remove|list [@member]",
-                value="Manage the whitelist (owner only).",
-                inline=False,
+EMBED_BUILDERS = {
+    "home": _embed_home,
+    "translate": _embed_translate,
+    "leash": _embed_leash,
+    "config": _embed_config,
+}
+
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self, author_id: int, level: str):
+        self.author_id = author_id
+        self.level = level
+        options = [
+            discord.SelectOption(
+                label=CATEGORIES[c]["label"], value=c, emoji=CATEGORIES[c]["emoji"]
             )
+            for c in allowed_categories(level)
+        ]
+        super().__init__(placeholder="Choose a category…", min_values=1, max_values=1, options=options)
 
-    await ctx.reply(embed=embed, mention_author=False)
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                f"⛔ This menu isn't for you. Run `{PREFIX}help` to open your own.",
+                ephemeral=True,
+            )
+            return
+        category = self.values[0]
+        embed = EMBED_BUILDERS[category](self.level)
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, author_id: int, level: str):
+        super().__init__(timeout=180)
+        self.add_item(HelpSelect(author_id, level))
+
+
+# ─── Command: help ────────────────────────────────────────────
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    """Open the help menu (categories shown depend on your role)."""
+    level = perm_level(ctx.author.id)
+    embed = _embed_home(level)
+    await ctx.reply(embed=embed, view=HelpView(ctx.author.id, level), mention_author=False)
 
 
 # ─── Auto-translation of messages ─────────────────────────────
@@ -829,7 +1042,15 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 # ─── Command error handling ───────────────────────────────────
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    if isinstance(error, commands.CheckFailure):
+    if isinstance(error, WrongChannel):
+        allowed = data.get("allowed_channels", [])
+        mentions = ", ".join(f"<#{cid}>" for cid in allowed)
+        await ctx.reply(
+            f"⛔ You can't use commands in this channel. "
+            f"Please head to {mentions}.\n"
+            f"💡 Note: `{PREFIX}translate` works everywhere."
+        )
+    elif isinstance(error, commands.CheckFailure):
         await ctx.reply("⛔ This command is reserved for the bot owner.")
     elif isinstance(error, commands.CommandNotFound):
         pass  # ignore unknown commands

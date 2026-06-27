@@ -66,16 +66,59 @@ auto_channels: set[int] = set()
 
 # ─── Leash (dog) system ───────────────────────────────────────
 DOG_EMOJI = "🐕"
-DATA_FILE = "leash_data.json"  # created automatically next to bot.py
+DATA_FILE = "leash_data.json"  # local fallback when no database is configured
+
+# ─── Persistent storage ───────────────────────────────────────
+# On Railway the filesystem is wiped on every redeploy, so we store everything
+# in PostgreSQL when DATABASE_URL is set. The whole `data` dict is saved as one
+# JSON blob, which keeps the rest of the code unchanged. Without DATABASE_URL
+# (local dev) we fall back to a JSON file.
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
-def load_data() -> dict:
-    """Load leashes, whitelist, per-user languages and auto channels."""
+def _db_conn():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL)
+
+
+def _db_init() -> None:
+    conn = _db_conn()
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        d = {}
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS bot_store "
+                "(id INT PRIMARY KEY, payload JSONB)"
+            )
+    finally:
+        conn.close()
+
+
+def _db_load() -> dict:
+    conn = _db_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT payload FROM bot_store WHERE id = 1")
+            row = cur.fetchone()
+            return row[0] if row and row[0] else {}
+    finally:
+        conn.close()
+
+
+def _db_save(payload: dict) -> None:
+    from psycopg2.extras import Json
+    conn = _db_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_store (id, payload) VALUES (1, %s) "
+                "ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload",
+                [Json(payload)],
+            )
+    finally:
+        conn.close()
+
+
+def _apply_defaults(d: dict) -> dict:
     d.setdefault("leashes", {})        # { "guild_id:user_id": {...} }
     d.setdefault("wl", [])             # [user_id, ...]
     d.setdefault("user_lang", {})      # { "user_id": "lang_code" }
@@ -88,9 +131,34 @@ def load_data() -> dict:
     return d
 
 
+def load_data() -> dict:
+    """Load all bot data from the database (or the JSON file locally)."""
+    if DATABASE_URL:
+        try:
+            _db_init()
+            d = _db_load()
+        except Exception as e:
+            print(f"⚠️ Database load failed, starting empty: {e}")
+            d = {}
+    else:
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            d = {}
+    return _apply_defaults(d)
+
+
 def save_data() -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """Persist all bot data to the database (or the JSON file locally)."""
+    if DATABASE_URL:
+        try:
+            _db_save(data)
+        except Exception as e:
+            print(f"⚠️ Database save failed: {e}")
+    else:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 data = load_data()
@@ -742,65 +810,148 @@ async def autorole(ctx: commands.Context, role: discord.Role = None):
 
 
 # ─── Command: setjoin (configure the welcome message) ─────────
+PLACEHOLDER_HELP = (
+    "`{user}` — mention / ping the new member\n"
+    "`{username}` — their username\n"
+    "`{name}` — their display name\n"
+    "`{server}` — the server name\n"
+    "`{membercount}` — number of members\n"
+    "`{id}` — their user ID"
+)
+
+
+def build_setjoin_embed(guild: discord.Guild) -> discord.Embed:
+    """Build the welcome-setup control panel embed."""
+    msg = data.get("welcome_message")
+    ch_id = data.get("welcome_channel")
+    channel = guild.get_channel(ch_id) if ch_id else None
+
+    embed = discord.Embed(
+        title="📨 Welcome setup",
+        description="Use the buttons below to configure the join message.",
+        color=0x5865F2,
+    )
+    embed.add_field(
+        name="Channel",
+        value=channel.mention if channel else "*not set*",
+        inline=True,
+    )
+    status = "🟢 Active" if (msg and ch_id) else "🔴 Inactive"
+    embed.add_field(name="Status", value=status, inline=True)
+    embed.add_field(
+        name="Message",
+        value=(msg[:1024] if msg else "*not set*"),
+        inline=False,
+    )
+    embed.add_field(name="Placeholders", value=PLACEHOLDER_HELP, inline=False)
+    embed.set_footer(text="Example:  Welcome {user} to {server}! You're member #{membercount}.")
+    return embed
+
+
+class SetJoinView(discord.ui.View):
+    def __init__(self, author_id: int):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                f"⛔ This panel isn't yours. Run `{PREFIX}setjoin` to open your own.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        await interaction.message.edit(embed=build_setjoin_embed(interaction.guild), view=self)
+
+    async def _prompt(self, interaction: discord.Interaction, prompt: str) -> discord.Message | None:
+        """Ask the owner for a message in chat and return it (None if cancelled)."""
+        await interaction.response.send_message(prompt, ephemeral=True)
+
+        def check(m: discord.Message) -> bool:
+            return m.author.id == self.author_id and m.channel.id == interaction.channel.id
+
+        try:
+            msg = await interaction.client.wait_for("message", check=check, timeout=120)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⌛ Timed out.", ephemeral=True)
+            return None
+        if msg.content.strip().lower() == "cancel":
+            await interaction.followup.send("❌ Cancelled.", ephemeral=True)
+            return None
+        return msg
+
+    @discord.ui.button(label="Edit message", style=discord.ButtonStyle.primary)
+    async def edit_message(self, interaction: discord.Interaction, button: discord.ui.Button):
+        msg = await self._prompt(
+            interaction,
+            "✏️ Send the new welcome message in this channel now "
+            "(type `cancel` to abort).",
+        )
+        if msg is None:
+            return
+        data["welcome_message"] = msg.content
+        save_data()
+        await interaction.followup.send("✅ Message updated.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Edit channel", style=discord.ButtonStyle.secondary)
+    async def edit_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        msg = await self._prompt(
+            interaction,
+            "📍 Mention the channel for welcomes (e.g. #welcome), "
+            "type `here` for this channel, or `cancel` to abort.",
+        )
+        if msg is None:
+            return
+        if msg.content.strip().lower() == "here":
+            data["welcome_channel"] = interaction.channel.id
+        elif msg.channel_mentions:
+            data["welcome_channel"] = msg.channel_mentions[0].id
+        else:
+            await interaction.followup.send(
+                "⚠️ No channel found in your message. Nothing changed.", ephemeral=True
+            )
+            return
+        save_data()
+        await interaction.followup.send("✅ Channel updated.", ephemeral=True)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Preview", style=discord.ButtonStyle.success)
+    async def preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tmpl = data.get("welcome_message")
+        if not tmpl:
+            await interaction.response.send_message(
+                "⚠️ Set a message first.", ephemeral=True
+            )
+            return
+        # Preview rendered with the owner as the example member.
+        await interaction.response.send_message(
+            "Preview:\n" + render_welcome(tmpl, interaction.user), ephemeral=True
+        )
+
+    @discord.ui.button(label="Disable", style=discord.ButtonStyle.danger)
+    async def disable(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data["welcome_message"] = None
+        data["welcome_channel"] = None
+        save_data()
+        await interaction.response.send_message(
+            "🔴 Welcome messages disabled.", ephemeral=True
+        )
+        await self._refresh(interaction)
+
+
+# ─── Command: setjoin (welcome control panel) ─────────────────
 @bot.command(name="setjoin")
 @is_owner()
 async def setjoin(ctx: commands.Context):
-    """Configure the welcome message via an in-chat prompt."""
-    current = data.get("welcome_message")
-    embed = discord.Embed(
-        title="📨 Welcome message setup",
-        description="Set the message sent when a new member joins.",
-        color=0x5865F2,
+    """Open the welcome-message control panel (buttons)."""
+    await ctx.reply(
+        embed=build_setjoin_embed(ctx.guild),
+        view=SetJoinView(ctx.author.id),
+        mention_author=False,
     )
-    if current:
-        embed.add_field(name="Current message", value=current[:1024], inline=False)
-    embed.add_field(
-        name="Available placeholders",
-        value=(
-            "`{user}` — mention / ping the new member\n"
-            "`{username}` — their username\n"
-            "`{name}` — their display name\n"
-            "`{server}` — the server name\n"
-            "`{membercount}` — number of members\n"
-            "`{id}` — their user ID"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="What to do now",
-        value=(
-            f"**Send your welcome message** in this channel.\n"
-            f"It will be posted in {ctx.channel.mention} on every join.\n\n"
-            f"To **cancel**, type `cancel` or just send nothing (times out in 120s)."
-        ),
-        inline=False,
-    )
-    embed.set_footer(text="Example:  Welcome {user} to {server}! You're member #{membercount}.")
-    await ctx.reply(embed=embed, mention_author=False)
-
-    def check(m: discord.Message) -> bool:
-        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
-
-    try:
-        reply = await bot.wait_for("message", check=check, timeout=120)
-    except asyncio.TimeoutError:
-        await ctx.send("⌛ Timed out — welcome message left unchanged.")
-        return
-
-    if reply.content.strip().lower() == "cancel":
-        await ctx.send("❌ Cancelled — welcome message left unchanged.")
-        return
-
-    data["welcome_message"] = reply.content
-    data["welcome_channel"] = ctx.channel.id
-    save_data()
-
-    preview = render_welcome(reply.content, ctx.author)
-    done = discord.Embed(title="✅ Welcome message saved", color=0x3BA55D)
-    done.add_field(name="Template", value=reply.content[:1024], inline=False)
-    done.add_field(name="Preview", value=preview[:1024], inline=False)
-    done.add_field(name="Posted in", value=ctx.channel.mention, inline=False)
-    await ctx.send(embed=done)
 
 
 # ──────────────────────────────────────────────────────────────
